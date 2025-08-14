@@ -1,0 +1,32 @@
+PyQt5>=5.15.0
+Pillow>=9.0.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+psutil>=5.8.0
+pyinstaller>=4.10
+h5py>=3.6.0
+zarr>=2.10.0
+dask>=2021.12.0
+imageio>=2.13.0
+matplotlib>=3.5.0
+scikit-image>=0.19.0
+
+# DICOM Support
+pydicom>=2.3.0
+SimpleITK>=2.2.0
+nibabel>=4.0.0
+
+# Enhanced Large File Handling (5GB+)
+tifffile>=2022.5.4
+mmap2>=1.0.0
+lz4>=4.0.0
+blosc>=1.11.0
+
+# Additional Scientific Libraries
+scipy>=1.9.0
+numba>=0.56.0  # JIT compilation for performance
+
+# Whole Slide Imaging Support (.svs files)
+openslide-python>=1.2.0  # For .svs and other WSI formats
+large-image>=1.20.0  # Advanced large image handling
+large-image[openslide]>=1.20.0  # OpenSlide source for large-image
