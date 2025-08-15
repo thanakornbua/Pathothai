@@ -1,3 +1,13 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+*.spec
+.venv/
+venv/
+env/
+*.log
 /data/
 Her2Neg_Case_06.png
 /output/

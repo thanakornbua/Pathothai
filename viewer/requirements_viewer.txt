@@ -1,0 +1,6 @@
+PyQt5>=5.15
+numpy
+Pillow
+pydicom
+openslide-python
+cx-Freeze
