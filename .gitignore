@@ -1,3 +1,13 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+*.spec
+.venv/
+venv/
+env/
+*.log
 /data/
 Her2Neg_Case_06.png
 /output/
@@ -5,3 +15,11 @@ Her2Neg_Case_06.png
 /output_dstrue/
 /report/
 Her2Neg_Case_05.png
+/vcpkg/
+/vendored/
+/image-viewer/
+/build/
+/.vs/
+/c-viewer/build/
+/c-viewer/out
+/large-image-viewer/test_images
