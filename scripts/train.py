@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,12 +16,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.model_selection import train_test_split
 import random
 from pathlib import Path
+from torch.utils.tensorboard import SummaryWriter
 
 class WholeSlideDataset(Dataset):
     """Dataset for handling whole slide images with patch extraction"""
     
     def __init__(self, slide_paths, labels, patch_size=224, patches_per_slide=50, 
-                 transform=None, svs_level=1, cache_patches=True):
+                 transform=None, svs_level=1, cache_patches=True, annotation_paths=None):
         self.slide_paths = slide_paths
         self.labels = labels
         self.patch_size = patch_size
@@ -29,6 +31,32 @@ class WholeSlideDataset(Dataset):
         self.svs_level = svs_level
         self.cache_patches = cache_patches
         self.patch_cache = {}
+        self.annotation_paths = annotation_paths if annotation_paths is not None else [None] * len(slide_paths)
+        self.regions = [self._parse_annotation(xml) if xml else None for xml in self.annotation_paths]
+
+    def _parse_annotation(self, xml_path):
+        """Parse XML annotation file and return list of regions with label and coordinates."""
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            regions = []
+            # For each Annotation, get its Name and all Regions under it
+            for annotation in root.findall('.//Annotation'):
+                annotation_label = annotation.attrib.get('Name', None)
+                for region in annotation.findall('.//Region'):
+                    label = region.attrib.get('Text', None)
+                    if not label:
+                        label = annotation_label
+                    coords = []
+                    for vertex in region.findall('.//Vertex'):
+                        x = float(vertex.attrib['X'])
+                        y = float(vertex.attrib['Y'])
+                        coords.append((x, y))
+                    regions.append({'label': label, 'coords': coords})
+            return regions
+        except Exception as e:
+            print(f"Error parsing annotation {xml_path}: {e}")
+            return []
         
     def __len__(self):
         return len(self.slide_paths) * self.patches_per_slide
@@ -69,18 +97,31 @@ class WholeSlideDataset(Dataset):
             return Image.new('RGB', (self.patch_size, self.patch_size), color='white')
     
     def _extract_svs_patch(self, slide_path, patch_idx):
-        """Extract patch from SVS file"""
+        """Extract patch from SVS file, using annotation if available."""
         slide = openslide.OpenSlide(slide_path)
         level_dims = slide.level_dimensions[self.svs_level]
-        
-        # Random patch extraction
-        max_x = max(0, level_dims[0] - self.patch_size)
-        max_y = max(0, level_dims[1] - self.patch_size)
-        
+        slide_idx = self.slide_paths.index(slide_path)
+        regions = self.regions[slide_idx] if self.regions else None
         random.seed(hash(f"{slide_path}_{patch_idx}") % (2**32))
-        x = random.randint(0, max_x)
-        y = random.randint(0, max_y)
-        
+        if regions and len(regions) > 0:
+            # Pick a random region, then a random point inside its bounding box
+            region = random.choice(regions)
+            xs = [pt[0] for pt in region['coords']]
+            ys = [pt[1] for pt in region['coords']]
+            min_x, max_x = int(min(xs)), int(max(xs))
+            min_y, max_y = int(min(ys)), int(max(ys))
+            max_x = max(min_x, max_x - self.patch_size)
+            max_y = max(min_y, max_y - self.patch_size)
+            if max_x > min_x and max_y > min_y:
+                x = random.randint(min_x, max_x)
+                y = random.randint(min_y, max_y)
+            else:
+                x = random.randint(0, level_dims[0] - self.patch_size)
+                y = random.randint(0, level_dims[1] - self.patch_size)
+        else:
+            # Fallback: random patch anywhere
+            x = random.randint(0, max(0, level_dims[0] - self.patch_size))
+            y = random.randint(0, max(0, level_dims[1] - self.patch_size))
         patch = slide.read_region((x, y), self.svs_level, 
                                  (self.patch_size, self.patch_size)).convert('RGB')
         slide.close()
@@ -118,14 +159,14 @@ class WSITrainer:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.mixed_precision = mixed_precision
-        
         # Initialize model
         self.model = self._create_model()
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = None
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
-        
+        # TensorBoard writer
+        self.writer = SummaryWriter(log_dir=str(self.checkpoint_dir / "runs"))
         # Training state
         self.current_epoch = 0
         self.best_val_acc = 0.0
@@ -207,7 +248,7 @@ class WSITrainer:
         self.optimizer = optim.AdamW(self.model.parameters(), 
                                    lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+            self.optimizer, mode='max', factor=0.5, patience=5)
     
     def save_checkpoint(self, epoch, val_acc, is_best=False):
         """Save model checkpoint"""
@@ -341,16 +382,12 @@ class WSITrainer:
         try:
             for epoch in range(start_epoch, num_epochs):
                 self.current_epoch = epoch
-                
                 # Train
                 train_loss, train_acc = self.train_epoch()
-                
                 # Validate
                 val_loss, val_acc = self.validate()
-                
                 # Update learning rate
                 self.scheduler.step(val_acc)
-                
                 # Save training history
                 epoch_info = {
                     'epoch': epoch,
@@ -361,26 +398,39 @@ class WSITrainer:
                     'lr': self.optimizer.param_groups[0]['lr']
                 }
                 self.training_history.append(epoch_info)
-                
+                # TensorBoard logging
+                try:
+                    self.writer.add_scalar("train/loss", train_loss, epoch)
+                    self.writer.add_scalar("train/accuracy", train_acc, epoch)
+                    self.writer.add_scalar("val/loss", val_loss, epoch)
+                    self.writer.add_scalar("val/accuracy", val_acc, epoch)
+                    self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], epoch)
+                except Exception:
+                    pass
                 # Print results
                 print(f"Epoch {epoch+1}/{num_epochs}")
                 print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
                 print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
                 print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
                 print("-" * 50)
-                
                 # Save checkpoint
                 is_best = val_acc > self.best_val_acc
                 if is_best:
                     self.best_val_acc = val_acc
-                
                 if (epoch + 1) % save_every == 0 or is_best:
                     self.save_checkpoint(epoch, val_acc, is_best)
-                
         except KeyboardInterrupt:
             print("\nTraining interrupted by user")
             self.save_checkpoint(self.current_epoch, val_acc)
-            
+            try:
+                self.writer.close()
+            except Exception:
+                pass
+            raise
+        try:
+            self.writer.close()
+        except Exception:
+            pass
         print("Training completed!")
         print(f"Best validation accuracy: {self.best_val_acc:.4f}")
 
