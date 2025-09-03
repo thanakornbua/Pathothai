@@ -137,7 +137,9 @@ class Conversiontopng:
 
             try:
                 # Ensure output directory exists
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                output_dir = os.path.dirname(output_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
 
                 if ext == '.dcm':  # Handle DICOM
                     ds = pydicom.dcmread(filepath)
