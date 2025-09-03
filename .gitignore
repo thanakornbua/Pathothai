@@ -25,3 +25,5 @@ Her2Neg_Case_05.png
 /large-image-viewer/test_images
 /Annotations/
 /checkpoints/
+*.png
+*.csv
