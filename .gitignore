@@ -51,3 +51,5 @@ Her2Neg_Case_05.png
 !/Annotations/.gitkeep
 !/checkpoints/README.md
 !/checkpoints/.gitkeep
+
+*.tfevents.*
