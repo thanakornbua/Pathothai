@@ -133,6 +133,14 @@ class MockWriter:
 # Native H&E stain normalization (no external dependencies)
 # Removed staintools dependency due to build issues
 
+# Ensure project root is in sys.path for package-style imports when running via file path
+try:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+except Exception:
+    pass
+
 # Import augmentation functions
 from scripts.augmentations import (
     get_tissue_mask_otsu,
@@ -212,6 +220,22 @@ class Config:
     USE_OTSU_TISSUE_MASK = True
     ELASTIC_DEFORM_PROB = 0.3
     STAIN_AUGMENT_PROB = 0.5
+
+    # Fast mode (PoC) presets
+    FAST_MODE = False  # When True, apply overrides for a much faster PoC run
+    # Sensible defaults for a quick run; can be tweaked if needed
+    FAST_INPUT_SIZE = 256  # Downscale inputs on-the-fly for speed (keeps patch extraction pipeline unchanged)
+    FAST_EPOCHS_PHASE1 = 5
+    FAST_EPOCHS_PHASE2 = 5
+    FAST_EPOCHS_SEG = 3
+    FAST_PATCHES_PER_SLIDE_PHASE1 = 32
+    FAST_PATCHES_PER_SLIDE_PHASE2 = 64
+    FAST_PATCHES_PER_SLIDE_SEG = 16
+    FAST_ELASTIC_DEFORM_PROB = 0.1
+    FAST_STAIN_AUGMENT_PROB = 0.25
+    FAST_USE_OTSU_TISSUE_MASK = False
+    FAST_GRADIENT_CHECKPOINT = False
+    FAST_IGNORE_CHECKPOINTS = True  # Start fresh (do not auto-resume) when in fast mode
     
     def __post_init__(self):
         """Create necessary directories"""
@@ -225,6 +249,79 @@ class Config:
         return {k: str(v) if isinstance(v, Path) else v 
                 for k, v in self.__dict__.items() 
                 if not k.startswith('_')}
+
+# --- Fast mode override helper -------------------------------------------------
+def apply_fast_mode_overrides(config: Config):
+    """Apply PoC-friendly overrides when FAST_MODE is enabled.
+
+    Idempotent: runs only once per config instance.
+    """
+    try:
+        if getattr(config, '_fast_applied', False):
+            return
+    except Exception:
+        pass
+
+    if not getattr(config, 'FAST_MODE', False):
+        return
+
+    # Record original values (optional future use)
+    try:
+        config._original_settings = {
+            'INPUT_SIZE': config.INPUT_SIZE,
+            'EPOCHS_PHASE1': config.EPOCHS_PHASE1,
+            'EPOCHS_PHASE2': config.EPOCHS_PHASE2,
+            'PATCHES_PER_SLIDE_PHASE1': config.PATCHES_PER_SLIDE_PHASE1,
+            'PATCHES_PER_SLIDE_PHASE2': config.PATCHES_PER_SLIDE_PHASE2,
+            'PATCHES_PER_SLIDE_SEG': config.PATCHES_PER_SLIDE_SEG,
+            'PATCH_SIZE_SEG': config.PATCH_SIZE_SEG,
+            'ELASTIC_DEFORM_PROB': config.ELASTIC_DEFORM_PROB,
+            'STAIN_AUGMENT_PROB': config.STAIN_AUGMENT_PROB,
+            'USE_OTSU_TISSUE_MASK': config.USE_OTSU_TISSUE_MASK,
+            'GRADIENT_CHECKPOINT': config.GRADIENT_CHECKPOINT,
+        }
+    except Exception:
+        pass
+
+    # Core overrides for speed
+    config.INPUT_SIZE = getattr(config, 'FAST_INPUT_SIZE', 256)
+    config.EPOCHS_PHASE1 = getattr(config, 'FAST_EPOCHS_PHASE1', 5)
+    config.EPOCHS_PHASE2 = getattr(config, 'FAST_EPOCHS_PHASE2', 5)
+    config.PATCHES_PER_SLIDE_PHASE1 = getattr(config, 'FAST_PATCHES_PER_SLIDE_PHASE1', 32)
+    config.PATCHES_PER_SLIDE_PHASE2 = getattr(config, 'FAST_PATCHES_PER_SLIDE_PHASE2', 64)
+    config.PATCHES_PER_SLIDE_SEG = getattr(config, 'FAST_PATCHES_PER_SLIDE_SEG', 16)
+    # Slightly reduce segmentation patch size for quicker batches
+    try:
+        config.PATCH_SIZE_SEG = min(config.PATCH_SIZE_SEG, 192)
+    except Exception:
+        pass
+
+    # Lighter augmentations and sampling
+    config.ELASTIC_DEFORM_PROB = getattr(config, 'FAST_ELASTIC_DEFORM_PROB', 0.1)
+    config.STAIN_AUGMENT_PROB = getattr(config, 'FAST_STAIN_AUGMENT_PROB', 0.25)
+    config.USE_OTSU_TISSUE_MASK = getattr(config, 'FAST_USE_OTSU_TISSUE_MASK', False)
+    config.GRADIENT_CHECKPOINT = getattr(config, 'FAST_GRADIENT_CHECKPOINT', False)
+
+    # Matmul precision for extra speed on newer GPUs (safe for PoC)
+    try:
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
+
+    # Mark applied and print concise summary
+    config._fast_applied = True
+    try:
+        print(
+            f"[FAST] Fast mode enabled: INPUT_SIZE={config.INPUT_SIZE}, "
+            f"EPOCHS(P1/P2)={config.EPOCHS_PHASE1}/{config.EPOCHS_PHASE2}, "
+            f"PATCHES/SLIDE(P1/P2/Seg)={config.PATCHES_PER_SLIDE_PHASE1}/"
+            f"{config.PATCHES_PER_SLIDE_PHASE2}/{config.PATCHES_PER_SLIDE_SEG}, "
+            f"SEG_PATCH={config.PATCH_SIZE_SEG}, OTSU={config.USE_OTSU_TISSUE_MASK}, "
+            f"CKPT={config.GRADIENT_CHECKPOINT}"
+        )
+    except Exception:
+        pass
 
 # Custom Dataset Classes
 class HER2WSIDataset(Dataset):
@@ -756,6 +853,8 @@ def get_data_loaders(config: Config, fold: int = 0, phase: str = 'phase1'):
 
 def train_phase1(config: Config, fold: int = 0, writer = None):
     """Phase 1: ROI-supervised classification training"""
+    # Apply fast-mode overrides (no-op if disabled)
+    apply_fast_mode_overrides(config)
     
     # Initialize TensorBoard writer if available and not provided
     if writer is None and TENSORBOARD_AVAILABLE and config.TENSORBOARD_DIR:
@@ -861,8 +960,8 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
     global_step = 0
     start_epoch = 0
 
-    # Resume if latest checkpoint exists
-    if latest_ckpt_path.exists():
+    # Resume if latest checkpoint exists (unless fast mode requests fresh start)
+    if not (getattr(config, 'FAST_MODE', False) and getattr(config, 'FAST_IGNORE_CHECKPOINTS', False)) and latest_ckpt_path.exists():
         try:
             ckpt = torch.load(latest_ckpt_path, map_location=config.DEVICE)
             model.load_state_dict(ckpt.get('model', {}))
@@ -1182,10 +1281,13 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
         ]
         wandb.log({"training_summary": wandb.Table(data=summary_data, columns=["Metric", "Value"])})
         
-    wandb.finish()
+    if WANDB_AVAILABLE:
+        wandb.finish()
 
 def train_phase2(config: Config, fold: int = 0, writer = None):
     """Phase 2: MIL fine-tuning with frozen early layers"""
+    # Apply fast-mode overrides (no-op if disabled)
+    apply_fast_mode_overrides(config)
     
     if WANDB_AVAILABLE:
         # Enhanced wandb initialization for Phase 2
@@ -1278,7 +1380,7 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
     global_step = 0
     start_epoch = 0
 
-    if latest_ckpt_path.exists():
+    if not (getattr(config, 'FAST_MODE', False) and getattr(config, 'FAST_IGNORE_CHECKPOINTS', False)) and latest_ckpt_path.exists():
         try:
             ckpt = torch.load(latest_ckpt_path, map_location=config.DEVICE)
             model.load_state_dict(ckpt.get('model', {}))
@@ -1662,6 +1764,8 @@ def explain_predictions(config: Config, model_path: str, fold: int = 0, num_samp
 
 def train_segmentation(config: Config, fold: int = 0, writer = None):
     """Train segmentation model"""
+    # Apply fast-mode overrides (no-op if disabled)
+    apply_fast_mode_overrides(config)
     
     if WANDB_AVAILABLE:
         wandb.init(project=config.WANDB_PROJECT, name=f"segmentation_fold{fold}", config=vars(config))
@@ -1712,7 +1816,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
     global_step = 0
     start_epoch = 0
 
-    if latest_ckpt_path.exists():
+    if not (getattr(config, 'FAST_MODE', False) and getattr(config, 'FAST_IGNORE_CHECKPOINTS', False)) and latest_ckpt_path.exists():
         try:
             ckpt = torch.load(latest_ckpt_path, map_location=config.DEVICE)
             model.load_state_dict(ckpt.get('model', {}))
@@ -2038,6 +2142,7 @@ def main():
     parser.add_argument('--phase', type=str, choices=['phase1', 'phase2', 'segmentation', 'all', 'optimize'], default='all', help='Training phase')
     parser.add_argument('--gpu', type=str, default='0', help='GPU device')
     parser.add_argument('--optimize-trials', type=int, default=50, help='Number of Optuna trials')
+    parser.add_argument('--fast', action='store_true', help='Enable fast PoC mode (fewer epochs, fewer patches, downscale inputs)')
     
     args = parser.parse_args()
     
@@ -2051,6 +2156,15 @@ def main():
             config_dict = json.load(f)
             for key, value in config_dict.items():
                 setattr(config, key, value)
+
+    # Apply --fast overrides if requested
+    if getattr(args, 'fast', False):
+        try:
+            config.FAST_MODE = True
+            config.FAST_IGNORE_CHECKPOINTS = True
+            apply_fast_mode_overrides(config)
+        except Exception as e:
+            print(f"[FAST] Could not apply fast mode from CLI: {e}")
     
     # Enable optimizations
     if torch.cuda.is_available():

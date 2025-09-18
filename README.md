@@ -174,6 +174,47 @@ python train_her2_pipeline.py --phase segmentation --fold 0
 python train_her2_pipeline.py --phase all --fold 0
 ```
 
+### Fast PoC Mode (CLI)
+
+For a much quicker run (fewer epochs, fewer patches per slide, optional input downscale), enable Fast Mode with the `--fast` flag. This is ideal for smoke tests and demos.
+
+PowerShell examples (Windows):
+
+```powershell
+# Phase 1 only (fast mode)
+python scripts\train.py --phase phase1 --fold 0 --fast
+
+# Phase 2 only (fast mode)
+python scripts\train.py --phase phase2 --fold 0 --fast
+
+# Segmentation (fast mode)
+python scripts\train.py --phase segmentation --fold 0 --fast
+```
+
+What `--fast` does by default:
+- Reduces epochs (e.g., Phase1/2 ≈ 5, Seg ≈ 3)
+- Reduces patches per slide (e.g., 32/64/16 for Phase1/Phase2/Seg)
+- Optionally downsizes inputs on-the-fly (e.g., to 256 px)
+- Lowers augmentation intensity and disables gradient checkpointing
+- Starts fresh and skips auto-resume (can be adjusted in `Config`)
+
+Note: The Jupyter notebook also has a "Fast PoC toggle" cell that applies the same overrides when set to `True`.
+
+### Troubleshooting CLI invocation
+
+If you see import errors like `ModuleNotFoundError: No module named 'scripts.augmentations'` when running by absolute path, try running the module instead from the project root:
+
+```powershell
+# From the project root folder
+python -m scripts.train --help
+```
+
+Alternatively, ensure the project root is on `PYTHONPATH` before executing the script by path:
+
+```powershell
+$env:PYTHONPATH = "$PWD"; python .\scripts\train.py --help
+```
+
 ### 3. Monitoring Training with TensorBoard
 
 The pipeline includes comprehensive TensorBoard logging for real-time monitoring:

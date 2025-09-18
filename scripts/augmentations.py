@@ -527,23 +527,46 @@ def get_segmentation_transforms(phase: str = 'train', elastic_deform_prob: float
     config = AugmentationConfig()
     
     if phase == 'train':
-        return Compose([
+        # Build a version-safe transform list
+        tx: list = [
             # Convert numpy arrays to tensors
             EnsureTyped(keys=['image', 'mask'], data_type='tensor'),
             # Add channel dimension if needed
             EnsureChannelFirstd(keys=['image'], channel_dim=-1),
-            # Elastic deformation
-            monai.transforms.RandElasticd(
-                keys=['image', 'mask'],
-                sigma_range=(5, 7),
-                magnitude_range=(100, 200),
-                prob=elastic_deform_prob,
-                rotate_range=0.1,
-                shear_range=0.1,
-                translate_range=10,
-                mode=['bilinear', 'nearest'],
-                padding_mode='border'
-            ),
+        ]
+
+        # Elastic-like deformation (prefer Rand2DElasticd; fallback to RandGridDistortiond; else skip)
+        elastic = None
+        try:
+            if hasattr(monai.transforms, 'Rand2DElasticd'):
+                elastic = monai.transforms.Rand2DElasticd(
+                    keys=['image', 'mask'],
+                    spacing=(32, 32),
+                    magnitude_range=(1.0, 2.0),
+                    rotate_range=(-0.1, 0.1),
+                    shear_range=(-0.1, 0.1),
+                    translate_range=(-10, 10),
+                    scale_range=(0.0, 0.0),
+                    prob=elastic_deform_prob,
+                    mode=['bilinear', 'nearest'],
+                    padding_mode='border'
+                )
+            elif hasattr(monai.transforms, 'RandGridDistortiond'):
+                elastic = monai.transforms.RandGridDistortiond(
+                    keys=['image', 'mask'],
+                    prob=elastic_deform_prob,
+                    distort_limit=0.02,
+                    mode=['bilinear', 'nearest'],
+                    padding_mode='border'
+                )
+        except Exception as _:
+            elastic = None
+
+        if elastic is not None:
+            tx.append(elastic)
+
+        # Additional common augmentations
+        tx.extend([
             RandRotated(keys=['image', 'mask'], range_x=0.1, prob=0.5, mode=['bilinear', 'nearest']),
             RandFlipd(keys=['image', 'mask'], spatial_axis=0, prob=0.5),
             RandFlipd(keys=['image', 'mask'], spatial_axis=1, prob=0.5),
@@ -554,6 +577,8 @@ def get_segmentation_transforms(phase: str = 'train', elastic_deform_prob: float
             # Final type conversion
             EnsureTyped(keys=['image', 'mask'], data_type='tensor', dtype=torch.float32)
         ])
+
+        return Compose(tx)
     else:  # validation
         return Compose([
             EnsureTyped(keys=['image', 'mask'], data_type='tensor'),
