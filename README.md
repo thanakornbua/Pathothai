@@ -339,19 +339,8 @@ plt.show()
 - **Model Parallelism**: For very large models, use `torch.nn.DataParallel`
 - **Gradient Checkpointing**: For memory-efficient training
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```
-@article{her2_pipeline_2024,
-  title={Multi-task Deep Learning for HER2 Status Classification and Tumor Segmentation in Breast Cancer},
-  author={Your Name},
-  journal={arXiv preprint},
-  year={2024}
-}
-```
 
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
