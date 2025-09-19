@@ -1,0 +1,28 @@
+{
+  "title": "ROI-supervised HER2 Classification – Publication Package",
+  "version": "1.0.0",
+  "generated_at": "",
+  "assets": [
+    {
+      "path": "figures/confusion_matrix_phase1.png",
+      "type": "figure",
+      "description": "Confusion matrix for Phase 1 ROI-supervised classification",
+      "source": "wandb artifact or notebook plotting",
+      "checksum": ""
+    },
+    {
+      "path": "figures/roc_curve_phase1.png",
+      "type": "figure",
+      "description": "ROC curve for Phase 1",
+      "source": "wandb artifact or notebook plotting",
+      "checksum": ""
+    },
+    {
+      "path": "figures/gradcam_example.png",
+      "type": "figure",
+      "description": "Representative Grad-CAM overlay on ROI patch",
+      "source": "notebook explain_predictions() output",
+      "checksum": ""
+    }
+  ]
+}
