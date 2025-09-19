@@ -20,7 +20,7 @@ import pydicom
 import openslide
 
 # Reuse dataset and worker init from training
-from .deprecated_train import WholeSlideDataset, _worker_init_fn
+from .train import WholeSlideDataset, _worker_init_fn
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
