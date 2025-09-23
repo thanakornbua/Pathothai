@@ -136,21 +136,23 @@ class Conversiontopng:
                 return {"status": "skip", "filename": filename, "time": 0}
 
             try:
+                # Ensure output directory exists
+                output_dir = os.path.dirname(output_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+
                 if ext == '.dcm':  # Handle DICOM
                     ds = pydicom.dcmread(filepath)
                     pixel_array = ds.pixel_array
-                    
                     # Use CUDA for normalization if available
                     if pixel_array.ndim == 2:
                         normalized = converter._cuda_normalize_batch([pixel_array])[0]
                         img = Image.fromarray(normalized)
                     else:
                         img = Image.fromarray(pixel_array)
-                    
                     # Optimize PNG saving
                     img.save(output_path, optimize=True, compress_level=6)
                     processing_time = time.time() - start_time
-                    
                     return {
                         "status": "success", 
                         "filename": filename, 
@@ -162,7 +164,6 @@ class Conversiontopng:
                 elif ext == '.svs':  # Handle SVS
                     slide = openslide.OpenSlide(filepath)
                     level_dims = slide.level_dimensions
-
                     # Auto-select optimal level if enabled
                     level_to_use = svs_level
                     if auto_downsample:
@@ -170,15 +171,11 @@ class Conversiontopng:
                             if max(dims) < 4000:  # pick level with width/height < 4000px
                                 level_to_use = i
                                 break
-
                     img = slide.read_region((0, 0), level_to_use, level_dims[level_to_use]).convert("RGB")
-                    
                     # Optimize PNG saving
                     img.save(output_path, optimize=True, compress_level=6)
                     slide.close()
-                    
                     processing_time = time.time() - start_time
-                    
                     return {
                         "status": "success", 
                         "filename": filename, 
@@ -188,10 +185,8 @@ class Conversiontopng:
                         "time": processing_time,
                         "size": os.path.getsize(output_path)
                     }
-
                 else:
                     return {"status": "unsupported", "filename": filename, "time": 0}
-
             except Exception as e:
                 processing_time = time.time() - start_time
                 return {
@@ -204,15 +199,17 @@ class Conversiontopng:
                 # Force garbage collection to free memory
                 gc.collect()
 
-        # Gather valid files
-        files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.dcm', '.svs'))]
+        # Gather valid files recursively
+        all_files = []
+        for root, _, filenames in os.walk(input_folder):
+            for f in filenames:
+                if f.lower().endswith(('.dcm', '.svs')):
+                    all_files.append(os.path.join(root, f))
         if max_images is not None:
-            files = files[:max_images]
-        
-        stats['total_files'] = len(files)
-        tqdm.write(f"📁 Found {len(files)} files to process")
-        
-        if len(files) == 0:
+            all_files = all_files[:max_images]
+        stats['total_files'] = len(all_files)
+        tqdm.write(f"📁 Found {len(all_files)} files to process (recursive)")
+        if len(all_files) == 0:
             tqdm.write("⚠️ No valid files found!")
             return stats
 
@@ -220,16 +217,13 @@ class Conversiontopng:
         results = []
         try:
             with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
-                futures = {executor.submit(process_file_optimized, f): f for f in files}
-                
+                futures = {executor.submit(process_file_optimized, os.path.relpath(f, input_folder)): f for f in all_files}
                 progress_bar = tqdm(as_completed(futures), total=len(futures), 
                                   desc="🔄 Converting", unit="file")
-                
                 for future in progress_bar:
                     try:
                         result = future.result()
                         results.append(result)
-                        
                         # Update statistics
                         if result["status"] == "success":
                             stats['processed'] += 1
@@ -238,18 +232,15 @@ class Conversiontopng:
                             stats['skipped'] += 1
                         else:
                             stats['errors'] += 1
-                        
                         # Update progress bar with current stats
                         progress_bar.set_postfix({
                             'Processed': stats['processed'],
                             'Skipped': stats['skipped'],
                             'Errors': stats['errors']
                         })
-                        
                         # Call progress callback if provided
                         if progress_callback:
                             progress_callback(stats, result)
-                            
                     except Exception as e:
                         stats['errors'] += 1
                         results.append({
@@ -258,7 +249,6 @@ class Conversiontopng:
                             "error": str(e),
                             "time": 0
                         })
-
         except KeyboardInterrupt:
             tqdm.write("\n⏹️ Conversion interrupted by user")
             stats['interrupted'] = True

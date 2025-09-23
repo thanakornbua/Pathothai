@@ -8,12 +8,12 @@ dist/
 venv/
 env/
 *.log
-/data/
+/data/**
 Her2Neg_Case_06.png
-/output/
-/output_dsfalse/
-/output_dstrue/
-/report/
+/output/**
+/output_dsfalse/**
+/output_dstrue/**
+/report/**
 Her2Neg_Case_05.png
 /vcpkg/
 /vendored/
@@ -23,5 +23,33 @@ Her2Neg_Case_05.png
 /c-viewer/build/
 /c-viewer/out
 /large-image-viewer/test_images
-/Annotations/
-/checkpoints/
+/Annotations/**
+/checkpoints/**
+*.png
+*.csv
+/H&E-stained
+
+# Ignore Weights & Biases runs
+/wandb/
+
+# Allow publication assets (figures/examples) despite global png/csv ignore
+!publication/figures/**
+!publication/examples/**
+
+# Allow keeping placeholder files in ignored data directories for documentation
+!/data/README.md
+!/data/.gitkeep
+!/output/README.md
+!/output/.gitkeep
+!/output_dsfalse/README.md
+!/output_dsfalse/.gitkeep
+!/output_dstrue/README.md
+!/output_dstrue/.gitkeep
+!/report/README.md
+!/report/.gitkeep
+!/Annotations/README.md
+!/Annotations/.gitkeep
+!/checkpoints/README.md
+!/checkpoints/.gitkeep
+
+*.tfevents.*
