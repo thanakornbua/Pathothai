@@ -439,6 +439,43 @@ def apply_stain_normalization(patch: Image.Image, stain_normalizer) -> Image.Ima
 
 
 # Transform Definitions
+class ElasticTransform:
+    """Top-level elastic transform for picklability with DataLoader workers."""
+    def __init__(self, prob=0.3, alpha=100, sigma=10):
+        self.prob = prob
+        self.alpha = alpha
+        self.sigma = sigma
+
+    def __call__(self, image):
+        if np.random.random() < self.prob:
+            # Convert PIL to numpy, apply elastic, convert back
+            if isinstance(image, Image.Image):
+                img_np = np.array(image)
+                deformed = elastic_deformation(img_np, self.alpha, self.sigma)
+                return Image.fromarray(deformed)
+            else:
+                return elastic_deformation(image, self.alpha, self.sigma)
+        return image
+
+
+class HETransform:
+    """Top-level H&E stain augmentation transform (picklable)."""
+    def __init__(self, prob=0.5, alpha_range=(0.7, 1.3), beta_range=(0.7, 1.3)):
+        self.prob = prob
+        self.alpha_range = alpha_range
+        self.beta_range = beta_range
+
+    def __call__(self, image):
+        if np.random.random() < self.prob:
+            if isinstance(image, Image.Image):
+                img_np = np.array(image)
+                augmented = random_he_augmentation(img_np, self.alpha_range, self.beta_range)
+                return Image.fromarray(augmented)
+            else:
+                return random_he_augmentation(image, self.alpha_range, self.beta_range)
+        return image
+
+
 def get_classification_transforms(phase: str = 'train') -> transforms.Compose:
     """
     Get torchvision transforms for classification tasks
@@ -458,42 +495,7 @@ def get_classification_transforms(phase: str = 'train') -> transforms.Compose:
             transforms.RandomVerticalFlip(),
             transforms.ColorJitter(**config.COLOR_JITTER_PARAMS),
         ]
-        
-        # Add elastic deformation transform
-        class ElasticTransform:
-            def __init__(self, prob=0.3, alpha=100, sigma=10):
-                self.prob = prob
-                self.alpha = alpha
-                self.sigma = sigma
-                
-            def __call__(self, image):
-                if np.random.random() < self.prob:
-                    # Convert PIL to numpy, apply elastic, convert back
-                    if isinstance(image, Image.Image):
-                        img_np = np.array(image)
-                        deformed = elastic_deformation(img_np, self.alpha, self.sigma)
-                        return Image.fromarray(deformed)
-                    else:
-                        return elastic_deformation(image, self.alpha, self.sigma)
-                return image
-        
-        # Add H&E augmentation transform  
-        class HETransform:
-            def __init__(self, prob=0.5, alpha_range=(0.7, 1.3), beta_range=(0.7, 1.3)):
-                self.prob = prob
-                self.alpha_range = alpha_range
-                self.beta_range = beta_range
-                
-            def __call__(self, image):
-                if np.random.random() < self.prob:
-                    if isinstance(image, Image.Image):
-                        img_np = np.array(image)
-                        augmented = random_he_augmentation(img_np, self.alpha_range, self.beta_range)
-                        return Image.fromarray(augmented)
-                    else:
-                        return random_he_augmentation(image, self.alpha_range, self.beta_range)
-                return image
-        
+
         transform_list.extend([
             ElasticTransform(prob=config.ELASTIC_DEFORM_PROB),
             HETransform(prob=config.STAIN_AUGMENT_PROB),

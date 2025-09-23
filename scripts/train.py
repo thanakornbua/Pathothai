@@ -5,7 +5,7 @@ This module contains the core training functions for the HER2+ breast cancer
 classification and segmentation pipeline.
 
 Key Features:
-- Multi-phase training (ROI supervision → MIL → Segmentation)
+- Multi-phase training (ROI supervision -> MIL -> Segmentation)
 - Advanced data augmentation
 - Mixed precision training
 - Comprehensive evaluation
@@ -22,12 +22,13 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['OMP_NUM_THREADS'] = '1'
 
 import sys
+import collections
 import collections.abc
 if not hasattr(collections, 'Callable'):
-    import collections
     collections.Callable = collections.abc.Callable
 
 import json
+import inspect
 import argparse
 import logging
 from pathlib import Path
@@ -56,12 +57,61 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import time
 
+# --- Perf helpers -------------------------------------------------------------
+# Autocast context that honors preferred dtype (bf16/fp16) with safe fallback
+def autocast_ctx(config: 'Config'):
+    enabled = torch.cuda.is_available()
+    amp_dtype = getattr(config, 'AMP_DTYPE', torch.float16)
+    try:
+        return torch.cuda.amp.autocast(enabled=enabled, dtype=amp_dtype)
+    except Exception:
+        # Older PyTorch may not accept dtype arg; fallback to default autocast
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+# Create AdamW optimizer with optional fused kernels when supported
+def make_adamw(params, lr: float, weight_decay: float, config: 'Config'):
+    use_fused = bool(getattr(config, 'USE_FUSED_ADAMW', False)) and torch.cuda.is_available()
+    if use_fused:
+        try:
+            return optim.AdamW(params, lr=lr, weight_decay=weight_decay, fused=True)
+        except TypeError:
+            pass
+        except Exception:
+            pass
+    return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+# Global CUDA perf settings (safe no-ops on CPU)
+if torch.cuda.is_available():
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
+
 # Progress bars
 try:
     from tqdm.auto import tqdm
 except Exception:
     def tqdm(x, **kwargs):
         return x
+
+def safe_iter_progress(iterable, **kwargs):
+    """Yield items with tqdm if available; fall back to plain iteration on errors.
+    This guards against atypical tqdm builds lacking attributes like 'disp'.
+    """
+    try:
+        it = tqdm(iterable, **kwargs)
+        for item in it:
+            yield item
+    except Exception as e:
+        # Fallback to plain iteration when tqdm breaks (e.g., AttributeError: disp)
+        for item in iterable:
+            yield item
 
 # TensorBoard logging (optional)
 try:
@@ -98,6 +148,90 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("W&B not available. Install with: pip install wandb")
 
+# Global/default debug toggle (can be overridden on Config)
+WANDB_DEBUG_DEFAULT = bool(os.environ.get('WANDB_DEBUG', '0') not in ('0', '', 'false', 'False'))
+
+# --- W&B helpers: upload diagnostics + training logs -------------------------
+def _wandb_log_supporting_files(config: 'Config', fold: int, phase_name: str, final: bool = False):
+    """Attach diagnostics and training logs to the current W&B run as an artifact.
+
+    - Looks for output/logs/diagnostics.json and logs/diagnostics.json
+    - Always tries to attach logs/training.log
+    - Optionally logs a brief diagnostics summary as scalar fields
+    """
+    if not WANDB_AVAILABLE:
+        return
+    try:
+        from pathlib import Path as _Path
+        import json as _json
+
+        files_to_add = []
+        # Training log
+        train_log = _Path(config.LOG_DIR) / 'training.log'
+        if train_log.exists():
+            files_to_add.append(str(train_log))
+
+        # Diagnostics candidates
+        diag_paths = [
+            _Path('output') / 'logs' / 'diagnostics.json',
+            _Path(config.LOG_DIR) / 'diagnostics.json',
+        ]
+        diag_json = None
+        diag_file_used = None
+        for p in diag_paths:
+            if p.exists():
+                files_to_add.append(str(p))
+                try:
+                    diag_json = _json.loads(p.read_text(encoding='utf-8'))
+                    diag_file_used = str(p)
+                    break
+                except Exception:
+                    pass
+
+        # Create and log artifact if we have anything to add
+        if files_to_add:
+            suffix = 'final' if final else 'start'
+            art_name = f"{phase_name}_logs_fold{fold}_{suffix}"
+            artifact = wandb.Artifact(
+                name=art_name,
+                type='logs',
+                description=f"{phase_name} supporting logs ({suffix})"
+            )
+            for f in files_to_add:
+                try:
+                    artifact.add_file(f)
+                except Exception as _e:
+                    print(f"[wandb] Skipped adding file to artifact: {f} due to: {_e}")
+            try:
+                wandb.log_artifact(artifact)
+            except Exception as _e:
+                print(f"[wandb] Failed to log artifact {art_name}: {_e}")
+
+        # Log a compact diagnostics summary (as scalars/text)
+        if diag_json is not None:
+            try:
+                tc = (diag_json.get('torch_cuda') or {}).get('info') or {}
+                tr = (diag_json.get('triton_compile') or {}).get('info') or {}
+                overall_ok = bool(diag_json.get('overall_ok', False))
+                wandb.log({
+                    'system/diagnostics_overall_ok': overall_ok,
+                    'system/torch_version': str(tc.get('torch_version', 'n/a')),
+                    'system/cuda_available': bool(tc.get('cuda_available', False)),
+                    'system/gpu_name': str(tc.get('device_name', 'n/a')),
+                    'system/gpu_vram_gb': float(tc.get('total_vram_gb', 0) or 0),
+                    'system/bf16_supported': bool(tc.get('bf16_supported', False)),
+                    'system/has_torch_compile': bool(tr.get('has_torch_compile', False)),
+                    'system/has_triton': bool(tr.get('has_triton_module', False)),
+                    'system/compile_probe': bool(tr.get('compile_probe', False)),
+                    'system/compile_backend_used': str(tr.get('compile_backend_used', 'n/a')),
+                })
+                if diag_file_used:
+                    wandb.summary['diagnostics_file'] = diag_file_used
+            except Exception as _e:
+                print(f"[wandb] Failed to log diagnostics summary: {_e}")
+    except Exception as e:
+        print(f"[wandb] Support file logging failed: {e}")
+
 # Explainability
 try:
     from pytorch_grad_cam import GradCAM, ScoreCAM
@@ -115,6 +249,17 @@ try:
 except ImportError:
     OPTUNA_AVAILABLE = False
     print("Optuna not available. Install with: pip install optuna")
+
+# Safe tensor->NumPy conversion (casts bf16/fp16 to float32)
+def to_numpy_fp32(t):
+    import numpy as _np
+    if t is None:
+        return None
+    if isinstance(t, torch.Tensor):
+        return t.detach().to(dtype=torch.float32, device='cpu').numpy()
+    if isinstance(t, _np.ndarray):
+        return t
+    return _np.asarray(t, dtype=_np.float32)
 
 # Helper function for conditional TensorBoard logging
 def log_scalar(writer, tag: str, value, step: int):
@@ -186,7 +331,7 @@ class Config:
     LR_PHASE2 = 1e-5
     LEARNING_RATE = 1e-4  # Alias for consistency
     WEIGHT_DECAY = 1e-5
-    PATIENCE = 5
+    PATIENCE = 30
     MIN_DELTA = 0.001
     MAX_EPOCHS = 50  # For consistency
     
@@ -203,10 +348,17 @@ class Config:
     N_FOLDS = 5
     
     # Optimization settings
-    USE_TORCH_COMPILE = False  # Disable torch.compile to avoid Triton issues
+    # On Windows, Triton/Inductor isn't supported; default to False. On other OSes, try compile with safe fallback.
+    USE_TORCH_COMPILE = (False if (os.name == 'nt') else True)
     GRADIENT_ACCUMULATION_STEPS = 1  # Gradient accumulation for larger effective batch size
     MAX_GRAD_NORM = 1.0  # Gradient clipping
     PREFETCH_FACTOR = 2  # DataLoader prefetch factor
+    USE_CHANNELS_LAST = True  # Use NHWC memory format for conv speedups
+    # Prefer bfloat16 autocast on supported GPUs; fallback to float16
+    AMP_DTYPE = (torch.bfloat16 if torch.cuda.is_available() and \
+                 hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported() else torch.float16)
+    USE_FUSED_ADAMW = True  # Use fused AdamW on supported PyTorch/CUDA
+    ZERO_SET_TO_NONE = True  # optimizer.zero_grad(set_to_none=True) to reduce allocator overhead
     # Memory-savings (disabled by default to keep full resolution and trainable params)
     INPUT_SIZE = None  # When set (e.g., 224), tensors are resized before forward; None keeps original size
     LOW_MEM_MODE = False  # If True, freeze backbone and run it in eval mode to save memory
@@ -221,8 +373,27 @@ class Config:
     ELASTIC_DEFORM_PROB = 0.3
     STAIN_AUGMENT_PROB = 0.5
 
+    # ROI enforcement
+    # When True, Phase 1 (ROI-supervised) will only use slides that have ROI annotations,
+    # and patches will be sampled exclusively from annotated regions.
+    REQUIRE_ROI_FOR_PHASE1 = True
+    # When True, Segmentation training will only use slides that have ROI annotations
+    # (to generate masks). Slides without annotations will be excluded.
+    REQUIRE_ROI_FOR_SEGMENTATION = True
+
+    # Strict ROI behavior
+    # If False (default strict mode), Phase 1 NEVER samples outside ROI; if an ROI is smaller than the
+    # effective patch, it will retry up to ROI_MAX_SAMPLING_ATTEMPTS, otherwise raise.
+    # If True, allows a last-resort fallback to random sampling outside ROI.
+    ALLOW_FALLBACK_OUTSIDE_ROI = False
+    ROI_MAX_SAMPLING_ATTEMPTS = 20
+
+    # Segmentation: require patches to contain positive mask pixels
+    REQUIRE_POSITIVE_MASK_PATCHES = True
+    POS_MASK_MAX_ATTEMPTS = 20
+
     # Fast mode (PoC) presets
-    FAST_MODE = False  # When True, apply overrides for a much faster PoC run
+    FAST_MODE = True  # When True, apply overrides for a much faster PoC run
     # Sensible defaults for a quick run; can be tweaked if needed
     FAST_INPUT_SIZE = 256  # Downscale inputs on-the-fly for speed (keeps patch extraction pipeline unchanged)
     FAST_EPOCHS_PHASE1 = 5
@@ -236,6 +407,14 @@ class Config:
     FAST_USE_OTSU_TISSUE_MASK = False
     FAST_GRADIENT_CHECKPOINT = False
     FAST_IGNORE_CHECKPOINTS = True  # Start fresh (do not auto-resume) when in fast mode
+
+    # Batch caps (useful for notebooks/smoke tests)
+    # When set, training/validation loops will process at most this many batches per epoch.
+    MAX_TRAIN_BATCHES_PER_EPOCH = None
+    MAX_VAL_BATCHES_PER_EPOCH = None
+    # Fast-mode defaults for quick iteration
+    FAST_MAX_TRAIN_BATCHES_PER_EPOCH = 8
+    FAST_MAX_VAL_BATCHES_PER_EPOCH = 4
     
     def __post_init__(self):
         """Create necessary directories"""
@@ -249,6 +428,109 @@ class Config:
         return {k: str(v) if isinstance(v, Path) else v 
                 for k, v in self.__dict__.items() 
                 if not k.startswith('_')}
+
+# --- Config coercion helper ---------------------------------------------------
+def coerce_to_train_config(cfg):
+    """Coerce various config types (e.g., PipelineConfig) to legacy training Config.
+
+    Accepts either an existing legacy Config-like object (with PATCH_SIZE etc.)
+    or a PipelineConfig from scripts.config, and returns an object with the
+    attributes that training expects.
+    """
+    # If it already looks like our legacy Config, return as-is
+    if hasattr(cfg, 'PATCH_SIZE') and hasattr(cfg, 'N_FOLDS') and hasattr(cfg, 'BATCH_SIZE'):
+        return cfg
+
+    # Heuristic: detect PipelineConfig-like structure
+    has_sections = all(hasattr(cfg, sec) for sec in ('data', 'model', 'training'))
+    if has_sections:
+        # Build a new legacy Config and map key fields
+        legacy = Config()
+        try:
+            # Paths and data
+            data_dir = getattr(cfg.data, 'data_dir', 'data')
+            annotations_dir = getattr(cfg.data, 'annotations_dir', 'Annotations')
+            checkpoints_dir = getattr(cfg.data, 'checkpoints_dir', 'checkpoints')
+
+            legacy.DATA_DIR = Path(data_dir)
+            legacy.ANNOTATIONS_DIR = Path(annotations_dir)
+            legacy.METADATA_FILE = Path(data_dir) / 'metadata.csv'
+            legacy.CHECKPOINT_DIR = Path(checkpoints_dir)
+            legacy.LOG_DIR = Path('logs')
+            if TENSORBOARD_AVAILABLE:
+                legacy.TENSORBOARD_DIR = legacy.LOG_DIR / 'tensorboard'
+
+            # Core model/training sizes
+            legacy.PATCH_SIZE = int(getattr(cfg.data, 'patch_size', legacy.PATCH_SIZE))
+            legacy.BATCH_SIZE = int(getattr(cfg.model, 'batch_size', legacy.BATCH_SIZE))
+            legacy.NUM_CLASSES = int(getattr(cfg.model, 'num_classes', legacy.NUM_CLASSES))
+
+            # LR / Epochs
+            legacy.LR_PHASE1 = float(getattr(cfg.model, 'learning_rate', legacy.LR_PHASE1))
+            legacy.EPOCHS_PHASE1 = int(getattr(cfg.model, 'num_epochs', legacy.EPOCHS_PHASE1))
+
+            # CV folds
+            legacy.N_FOLDS = int(getattr(cfg.training, 'cross_validation_folds', legacy.N_FOLDS))
+
+            # Data loader workers (important on Windows to avoid pickling issues)
+            legacy.NUM_WORKERS = int(getattr(cfg.training, 'num_workers', legacy.NUM_WORKERS))
+
+            # Patches per slide (per phase) — exposed in notebook TrainingConfigNB
+            try:
+                legacy.PATCHES_PER_SLIDE_PHASE1 = int(getattr(cfg.training, 'patches_per_slide_phase1', legacy.PATCHES_PER_SLIDE_PHASE1))
+            except Exception:
+                pass
+            try:
+                legacy.PATCHES_PER_SLIDE_PHASE2 = int(getattr(cfg.training, 'patches_per_slide_phase2', legacy.PATCHES_PER_SLIDE_PHASE2))
+            except Exception:
+                pass
+            try:
+                legacy.PATCHES_PER_SLIDE_SEG = int(getattr(cfg.training, 'patches_per_slide_seg', legacy.PATCHES_PER_SLIDE_SEG))
+            except Exception:
+                pass
+
+            # Optional fast-mode overrides for patches-per-slide if provided by notebook
+            try:
+                fps1 = getattr(cfg.training, 'fast_patches_per_slide_phase1', None)
+                if fps1 is not None:
+                    legacy.FAST_PATCHES_PER_SLIDE_PHASE1 = int(fps1)
+            except Exception:
+                pass
+            try:
+                fps2 = getattr(cfg.training, 'fast_patches_per_slide_phase2', None)
+                if fps2 is not None:
+                    legacy.FAST_PATCHES_PER_SLIDE_PHASE2 = int(fps2)
+            except Exception:
+                pass
+            try:
+                fpsg = getattr(cfg.training, 'fast_patches_per_slide_seg', None)
+                if fpsg is not None:
+                    legacy.FAST_PATCHES_PER_SLIDE_SEG = int(fpsg)
+            except Exception:
+                pass
+
+            # Device
+            dev = getattr(cfg.training, 'device', 'auto')
+            if dev == 'auto':
+                legacy.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            else:
+                try:
+                    legacy.DEVICE = torch.device(dev)
+                except Exception:
+                    legacy.DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+            # Ensure directories exist
+            try:
+                legacy.__post_init__()
+            except Exception:
+                pass
+        except Exception:
+            # If mapping fails for any reason, fall back to original cfg
+            return cfg
+        return legacy
+
+    # Unknown config type; return as-is
+    return cfg
 
 # --- Fast mode override helper -------------------------------------------------
 def apply_fast_mode_overrides(config: Config):
@@ -290,6 +572,12 @@ def apply_fast_mode_overrides(config: Config):
     config.PATCHES_PER_SLIDE_PHASE1 = getattr(config, 'FAST_PATCHES_PER_SLIDE_PHASE1', 32)
     config.PATCHES_PER_SLIDE_PHASE2 = getattr(config, 'FAST_PATCHES_PER_SLIDE_PHASE2', 64)
     config.PATCHES_PER_SLIDE_SEG = getattr(config, 'FAST_PATCHES_PER_SLIDE_SEG', 16)
+    # Limit batches per epoch for faster feedback
+    try:
+        config.MAX_TRAIN_BATCHES_PER_EPOCH = getattr(config, 'FAST_MAX_TRAIN_BATCHES_PER_EPOCH', 8)
+        config.MAX_VAL_BATCHES_PER_EPOCH = getattr(config, 'FAST_MAX_VAL_BATCHES_PER_EPOCH', 4)
+    except Exception:
+        pass
     # Slightly reduce segmentation patch size for quicker batches
     try:
         config.PATCH_SIZE_SEG = min(config.PATCH_SIZE_SEG, 192)
@@ -433,26 +721,34 @@ class HER2WSIDataset(Dataset):
             else:
                 x = np.random.randint(0, max(0, base_w - eff_size))
                 y = np.random.randint(0, max(0, base_h - eff_size))
-        elif self.phase == 'roi' and roi_coords:
-            # Extract from ROI
-            roi = roi_coords[np.random.randint(len(roi_coords))]
-            min_x, min_y, max_x, max_y = roi
-            
-            # Compute valid ranges ensuring patch fits within ROI bounds
-            max_valid_x = max(min_x, max_x - eff_size)
-            max_valid_y = max(min_y, max_y - eff_size)
-            
-            if max_valid_x >= min_x and max_valid_y >= min_y:
-                # Allow exact-fit case and clamp to slide bounds
-                x = np.random.randint(min_x, max_valid_x + 1) if max_valid_x > min_x else min_x
-                y = np.random.randint(min_y, max_valid_y + 1) if max_valid_y > min_y else min_y
-                # Clamp to slide dimensions just in case
-                x = int(np.clip(x, 0, max(0, base_w - eff_size)))
-                y = int(np.clip(y, 0, max(0, base_h - eff_size)))
-            else:
-                # Fallback to random if ROI is smaller than patch size
-                x = np.random.randint(0, max(0, base_w - eff_size))
-                y = np.random.randint(0, max(0, base_h - eff_size))
+        elif self.phase == 'roi':
+            # Strict ROI-only sampling
+            attempts = 0
+            found = False
+            if roi_coords:
+                while attempts < getattr(Config, 'ROI_MAX_SAMPLING_ATTEMPTS', 20):
+                    roi = roi_coords[np.random.randint(len(roi_coords))]
+                    min_x, min_y, max_x, max_y = roi
+                    max_valid_x = max(min_x, max_x - eff_size)
+                    max_valid_y = max(min_y, max_y - eff_size)
+                    if max_valid_x >= min_x and max_valid_y >= min_y:
+                        x = np.random.randint(min_x, max_valid_x + 1) if max_valid_x > min_x else min_x
+                        y = np.random.randint(min_y, max_valid_y + 1) if max_valid_y > min_y else min_y
+                        x = int(np.clip(x, 0, max(0, base_w - eff_size)))
+                        y = int(np.clip(y, 0, max(0, base_h - eff_size)))
+                        found = True
+                        break
+                    attempts += 1
+            if not found:
+                if getattr(Config, 'ALLOW_FALLBACK_OUTSIDE_ROI', False):
+                    # Last-resort fallback if enabled by config
+                    x = np.random.randint(0, max(0, base_w - eff_size))
+                    y = np.random.randint(0, max(0, base_h - eff_size))
+                else:
+                    raise RuntimeError(
+                        "Strict ROI-only mode: Could not sample a patch fully inside any ROI. "
+                        "Consider reducing PATCH_SIZE or enabling ALLOW_FALLBACK_OUTSIDE_ROI."
+                    )
         else:
             # Random patch or tissue region
             x = np.random.randint(0, max(0, base_w - eff_size))
@@ -553,13 +849,22 @@ class HER2SegmentationDataset(Dataset):
         downsample = slide.level_downsamples[self.slide_level] if hasattr(slide, 'level_downsamples') else (2 ** self.slide_level)
         eff_size = int(self.patch_size * float(downsample))
         
-        x = np.random.randint(0, max(0, base_w - eff_size))
-        y = np.random.randint(0, max(0, base_h - eff_size))
-        
-        # Extract patch and corresponding mask
-        patch = slide.read_region((x, y), self.slide_level, (self.patch_size, self.patch_size)).convert('RGB')
-        # Mask is defined at base resolution; crop uses base coords already
-        mask_patch = mask.crop((x, y, x + eff_size, y + eff_size)).resize((self.patch_size, self.patch_size), Image.NEAREST)
+        # Sample a patch; if required, ensure mask has positives
+        attempts = 0
+        while True:
+            x = np.random.randint(0, max(0, base_w - eff_size))
+            y = np.random.randint(0, max(0, base_h - eff_size))
+            patch = slide.read_region((x, y), self.slide_level, (self.patch_size, self.patch_size)).convert('RGB')
+            mask_patch = mask.crop((x, y, x + eff_size, y + eff_size)).resize((self.patch_size, self.patch_size), Image.NEAREST)
+            if getattr(Config, 'REQUIRE_POSITIVE_MASK_PATCHES', True):
+                if np.array(mask_patch).sum() > 0:
+                    break
+                attempts += 1
+                if attempts >= getattr(Config, 'POS_MASK_MAX_ATTEMPTS', 20):
+                    # Give up and return the current patch (avoids infinite loop on tiny ROIs)
+                    break
+            else:
+                break
         
         # Stain normalization/augmentation
         patch_np = np.array(patch)
@@ -769,6 +1074,57 @@ def get_data_loaders(config: Config, fold: int = 0, phase: str = 'phase1'):
     val_paths = [slide_paths[i] for i in val_indices]
     val_labels = [labels[i] for i in val_indices]
     val_annotations = [annotations[i] for i in val_indices]
+
+    # Optionally filter out slides without ROI annotations
+    if phase == 'phase1' and getattr(config, 'REQUIRE_ROI_FOR_PHASE1', True):
+        before_train = len(train_paths)
+        before_val = len(val_paths)
+        filtered = [(p, l, a) for p, l, a in zip(train_paths, train_labels, train_annotations) if a is not None and os.path.exists(a)]
+        if filtered:
+            train_paths, train_labels, train_annotations = map(list, zip(*filtered))
+        else:
+            train_paths, train_labels, train_annotations = [], [], []
+
+        filtered_v = [(p, l, a) for p, l, a in zip(val_paths, val_labels, val_annotations) if a is not None and os.path.exists(a)]
+        if filtered_v:
+            val_paths, val_labels, val_annotations = map(list, zip(*filtered_v))
+        else:
+            val_paths, val_labels, val_annotations = [], [], []
+
+        print(f"[ROI] Phase 1 ROI-only mode: filtered train {before_train}->{len(train_paths)}, val {before_val}->{len(val_paths)}")
+        if len(train_paths) == 0 or len(val_paths) == 0:
+            raise RuntimeError(
+                "No slides with ROI annotations remain after filtering. "
+                "Ensure metadata.annotation_path points to existing XML files or set "
+                "Config.REQUIRE_ROI_FOR_PHASE1 = False to allow fallback sampling."
+            )
+
+    if phase == 'segmentation' and getattr(config, 'REQUIRE_ROI_FOR_SEGMENTATION', True):
+        before_train = len(train_paths)
+        before_val = len(val_paths)
+        filtered = [(p, a) for p, a in zip(train_paths, train_annotations) if a is not None and os.path.exists(a)]
+        if filtered:
+            train_paths, train_annotations = map(list, zip(*filtered))
+            # Keep labels aligned length-wise (unused in seg); create dummies if needed
+            train_labels = [0] * len(train_paths)
+        else:
+            train_paths, train_annotations = [], []
+            train_labels = []
+
+        filtered_v = [(p, a) for p, a in zip(val_paths, val_annotations) if a is not None and os.path.exists(a)]
+        if filtered_v:
+            val_paths, val_annotations = map(list, zip(*filtered_v))
+            val_labels = [0] * len(val_paths)
+        else:
+            val_paths, val_annotations = [], []
+            val_labels = []
+
+        print(f"[ROI] Segmentation ROI-only mode: filtered train {before_train}->{len(train_paths)}, val {before_val}->{len(val_paths)}")
+        if len(train_paths) == 0 or len(val_paths) == 0:
+            raise RuntimeError(
+                "No slides with ROI annotations remain for segmentation after filtering. "
+                "Ensure XML annotations exist or set Config.REQUIRE_ROI_FOR_SEGMENTATION = False."
+            )
     
     # Stain normalizer using imported function
     stain_normalizer = create_stain_normalizer()
@@ -853,6 +1209,8 @@ def get_data_loaders(config: Config, fold: int = 0, phase: str = 'phase1'):
 
 def train_phase1(config: Config, fold: int = 0, writer = None):
     """Phase 1: ROI-supervised classification training"""
+    # Coerce incoming config to legacy training Config if it's a PipelineConfig
+    config = coerce_to_train_config(config)
     # Apply fast-mode overrides (no-op if disabled)
     apply_fast_mode_overrides(config)
     
@@ -865,6 +1223,17 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
                         attention_dim=config.ATTENTION_DIM, dropout=config.DROPOUT_RATE,
                         use_checkpoint=getattr(config, 'GRADIENT_CHECKPOINT', False))
     model = model.to(config.DEVICE)
+    if getattr(config, 'USE_CHANNELS_LAST', False) and torch.cuda.is_available():
+        try:
+            model = model.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
+    # Memory format optimization
+    if getattr(config, 'USE_CHANNELS_LAST', False) and torch.cuda.is_available():
+        try:
+            model = model.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
 
     # Low-memory mode (optional): freeze backbone to cut gradient memory; run BN in eval
     if getattr(config, 'LOW_MEM_MODE', False):
@@ -892,6 +1261,9 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
             }
         }
         
+        wandb_debug = bool(getattr(config, 'WANDB_DEBUG', WANDB_DEBUG_DEFAULT))
+        if wandb_debug:
+            print("[wandb] Debug mode enabled: richer logging will be captured.")
         wandb.init(
             project=config.WANDB_PROJECT, 
             name=f"Phase1_ROI_Supervised_fold{fold}",
@@ -899,6 +1271,26 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
             tags=['phase1', 'roi-supervised', 'classification', f'fold{fold}'],
             notes="ROI-supervised classification training with advanced augmentation"
         )
+        # Attach diagnostics and any existing training log at run start
+        _wandb_log_supporting_files(config, fold, phase_name='phase1', final=False)
+        # Log environment snapshot and dataloader sizes (as config/summary-friendly fields)
+        try:
+            # Prefer config update for static env info to avoid media panel type mismatches
+            wandb.config.update({
+                'env': {
+                    'python_version': sys.version.split()[0],
+                    'pytorch_version': torch.__version__,
+                    'cuda_available': torch.cuda.is_available(),
+                    'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU',
+                },
+                'data_info': {
+                    'train_batches_total': len(train_loader),
+                    'val_batches_total': len(val_loader),
+                    'batch_size': config.BATCH_SIZE,
+                }
+            }, allow_val_change=True)
+        except Exception:
+            pass
     
     # Enhanced wandb model tracking
     if WANDB_AVAILABLE:
@@ -918,16 +1310,25 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
     # Optimization: torch.compile for faster training (PyTorch 2.0+)
     if config.USE_TORCH_COMPILE and hasattr(torch, 'compile'):
         try:
-            # Test compilation with dummy input first
+            # Eager probe forward to verify shapes
             dummy_input = torch.randn(1, 1, 3, config.PATCH_SIZE, config.PATCH_SIZE).to(config.DEVICE)
             with torch.no_grad():
                 _ = model(dummy_input)
-            
-            model = torch.compile(model, mode='reduce-overhead')
+
+            compiled_model = torch.compile(model, mode='reduce-overhead')
+
+            # Probe compiled forward to catch Triton/Inductor issues early
+            with torch.no_grad():
+                _ = compiled_model(dummy_input)
+
+            model = compiled_model
             print("Model compiled with torch.compile for faster training")
         except Exception as e:
-            print(f"torch.compile failed, continuing without compilation: {e}")
-            # Continue without compilation
+            print(f"[compile] Disabled torch.compile for Phase 1 due to: {e}")
+            try:
+                config.USE_TORCH_COMPILE = False
+            except Exception:
+                pass
     
     # Optimization: Enable cuDNN benchmark for faster convolution
     if torch.cuda.is_available():
@@ -941,14 +1342,16 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
         pass
 
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=config.LR_PHASE1, weight_decay=config.WEIGHT_DECAY)
+    optimizer = make_adamw(model.parameters(), lr=config.LR_PHASE1, weight_decay=config.WEIGHT_DECAY, config=config)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
     
     # Loss
     criterion = nn.CrossEntropyLoss()
     
     # AMP
-    scaler = torch.cuda.amp.GradScaler()
+    # Disable GradScaler for bf16 (not needed); keep for fp16
+    use_bf16 = getattr(config, 'AMP_DTYPE', torch.float16) == torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
     
     # Checkpoint paths
     latest_ckpt_path = config.CHECKPOINT_DIR / f"phase1_fold{fold}_latest.pth"
@@ -994,14 +1397,18 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
         train_correct = 0
         train_total = 0
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Train E{epoch+1}", leave=False)):
+        max_train_batches = getattr(config, 'MAX_TRAIN_BATCHES_PER_EPOCH', None)
+        processed_train_batches = 0
+        for batch_idx, batch in enumerate(safe_iter_progress(train_loader, desc=f"Train E{epoch+1}", leave=False)):
             images, labels = batch
             images = images.to(config.DEVICE, non_blocking=True)
+            if getattr(config, 'USE_CHANNELS_LAST', False) and images.ndim == 4:
+                images = images.to(memory_format=torch.channels_last)
             labels = labels.to(config.DEVICE, non_blocking=True)
             
-            optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast():
+            optimizer.zero_grad(set_to_none=getattr(config, 'ZERO_SET_TO_NONE', True))
+
+            with autocast_ctx(config):
                 # For Phase 1, process each patch individually
                 # Reshape for MIL: [batch_size, 1, C, H, W] (1 patch per bag)
                 batch_size = images.size(0)
@@ -1036,8 +1443,9 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
             
             global_step += 1
             
-            # Log training metrics every 10 batches
-            if batch_idx % 10 == 0:
+            # Log training metrics on a configurable cadence
+            log_every = int(getattr(config, 'WANDB_BATCH_LOG_EVERY', 10))
+            if batch_idx % max(log_every, 1) == 0:
                 if writer: writer.add_scalar('train/batch_loss', loss.item() * config.GRADIENT_ACCUMULATION_STEPS, global_step)
                 if writer: writer.add_scalar('train/learning_rate', optimizer.param_groups[0]['lr'], global_step)
                 
@@ -1052,8 +1460,20 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
                         'batch/epoch': epoch,
                         'batch/samples_processed': global_step * config.BATCH_SIZE
                     }, step=global_step)
+                    # Optional: log a small grid of input samples
+                    if wandb_debug and batch_idx % (max(log_every, 1) * 5) == 0:
+                        try:
+                            import torchvision
+                            grid = torchvision.utils.make_grid(images.squeeze(1).detach().cpu()[:8], nrow=4, normalize=True, scale_each=True)
+                            wandb.log({'samples/train_batch_grid': wandb.Image(grid)}, step=global_step)
+                        except Exception:
+                            pass
+            processed_train_batches += 1
+            if max_train_batches is not None and processed_train_batches >= int(max_train_batches):
+                break
         
-        train_loss /= len(train_loader)
+        # Average over actual processed batches
+        train_loss /= max(processed_train_batches, 1)
         train_acc = 100. * train_correct / train_total
         
         # Validation
@@ -1065,9 +1485,13 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
         val_total = 0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Val   E{epoch+1}", leave=False):
+            max_val_batches = getattr(config, 'MAX_VAL_BATCHES_PER_EPOCH', None)
+            processed_val_batches = 0
+            for batch in safe_iter_progress(val_loader, desc=f"Val   E{epoch+1}", leave=False):
                 images, labels = batch
                 images = images.to(config.DEVICE, non_blocking=True)
+                if getattr(config, 'USE_CHANNELS_LAST', False) and images.ndim == 4:
+                    images = images.to(memory_format=torch.channels_last)
                 labels = labels.to(config.DEVICE, non_blocking=True)
                 
                 # For Phase 1, process each patch individually
@@ -1078,25 +1502,37 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
                     images = F.interpolate(images, size=(input_size, input_size), mode='bilinear', align_corners=False)
                 images = images.unsqueeze(1)  # [batch_size, 1, C, H, W]
                 
-                with torch.cuda.amp.autocast():
+                with autocast_ctx(config):
                     outputs, attention_weights = model(images)
                     # outputs shape: [batch_size, num_classes]
                     loss = criterion(outputs, labels)
                 
                 val_loss += loss.item()
                 
-                preds = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                preds = to_numpy_fp32(torch.softmax(outputs, dim=1)[:, 1])
                 all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
+                all_labels.extend(to_numpy_fp32(labels))
                 
                 # Calculate validation accuracy
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
-        
-        val_loss /= len(val_loader)
+                processed_val_batches += 1
+                if max_val_batches is not None and processed_val_batches >= int(max_val_batches):
+                    break
+
+        val_loss /= max(processed_val_batches, 1)
         val_acc = 100. * val_correct / val_total
-        val_auc = roc_auc_score(all_labels, all_preds)
+        # Robust AUC: skip when only one class present in y_true
+        try:
+            if len(set(all_labels)) > 1:
+                val_auc = roc_auc_score(all_labels, all_preds)
+            else:
+                val_auc = 0.0
+                print("[metrics] Skipping ROC AUC this epoch: only one class present in validation labels")
+        except Exception as e:
+            val_auc = 0.0
+            print(f"[metrics] AUC computation failed: {e}")
         
         # Calculate additional metrics
         from sklearn.metrics import f1_score, precision_score, recall_score
@@ -1204,7 +1640,8 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
             # Log confusion matrix and classification report
             if epoch % 5 == 0:  # Every 5 epochs
                 from sklearn.metrics import confusion_matrix, classification_report
-                cm = confusion_matrix(all_labels, (np.array(all_preds) > 0.5).astype(int))
+                # Be explicit about labels to ensure a 2x2 matrix even if one class missing
+                cm = confusion_matrix(all_labels, (np.array(all_preds) > 0.5).astype(int), labels=[0, 1])
                 
                 # Create confusion matrix plot
                 import matplotlib.pyplot as plt
@@ -1219,7 +1656,14 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
                 plt.close(fig)
                 
                 # Classification report
-                cr = classification_report(all_labels, (np.array(all_preds) > 0.5).astype(int), output_dict=True)
+                # Avoid errors when a class is missing; fill zeros where undefined
+                cr = classification_report(
+                    all_labels,
+                    (np.array(all_preds) > 0.5).astype(int),
+                    labels=[0, 1],
+                    zero_division=0,
+                    output_dict=True
+                )
                 wandb_metrics.update({
                     'classification/her2_neg_precision': cr['0']['precision'],
                     'classification/her2_neg_recall': cr['0']['recall'],
@@ -1230,17 +1674,38 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
                     'classification/macro_avg_f1': cr['macro avg']['f1-score'],
                     'classification/weighted_avg_f1': cr['weighted avg']['f1-score']
                 })
+                # Epoch PR and ROC curves (if debug enabled)
+                if wandb_debug:
+                    try:
+                        from sklearn.metrics import precision_recall_curve, roc_curve
+                        # PR
+                        p, r, _ = precision_recall_curve(all_labels, np.array(all_preds))
+                        import matplotlib.pyplot as plt
+                        fig_pr, ax_pr = plt.subplots()
+                        ax_pr.plot(r, p)
+                        ax_pr.set_xlabel('Recall'); ax_pr.set_ylabel('Precision'); ax_pr.set_title(f'PR Curve - E{epoch+1}')
+                        wandb_metrics['curves/pr'] = wandb.Image(fig_pr)
+                        plt.close(fig_pr)
+                        # ROC
+                        fpr, tpr, _ = roc_curve(all_labels, np.array(all_preds))
+                        fig_roc, ax_roc = plt.subplots()
+                        ax_roc.plot(fpr, tpr)
+                        ax_roc.set_xlabel('FPR'); ax_roc.set_ylabel('TPR'); ax_roc.set_title(f'ROC Curve - E{epoch+1}')
+                        wandb_metrics['curves/roc'] = wandb.Image(fig_roc)
+                        plt.close(fig_roc)
+                    except Exception:
+                        pass
             
             # Log model weights and gradients (every 10 epochs)
             if epoch % 10 == 0:
                 for name, param in model.named_parameters():
                     if param.grad is not None:
-                        wandb_metrics[f'gradients/{name}'] = wandb.Histogram(param.grad.detach().cpu().numpy())
-                    wandb_metrics[f'parameters/{name}'] = wandb.Histogram(param.detach().cpu().numpy())
+                        wandb_metrics[f'gradients/{name}'] = wandb.Histogram(to_numpy_fp32(param.grad))
+                    wandb_metrics[f'parameters/{name}'] = wandb.Histogram(to_numpy_fp32(param))
             
             # Log attention weights if available
             if attention_weights is not None and epoch % 5 == 0:
-                wandb_metrics['attention_weights'] = wandb.Histogram(attention_weights.detach().cpu().numpy())
+                wandb_metrics['attention_weights'] = wandb.Histogram(to_numpy_fp32(attention_weights))
             
             wandb.log(wandb_metrics)
         
@@ -1268,20 +1733,49 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
             "early_stopped": patience_counter >= config.PATIENCE
         })
         
-        # Create and log training summary table
-        summary_data = [
-            ["Metric", "Value"],
-            ["Best Validation AUC", f"{best_auc:.4f}"],
-            ["Final Validation Accuracy", f"{val_acc:.2f}%"],
-            ["Final F1 Score", f"{f1:.4f}"],
-            ["Final Precision", f"{precision:.4f}"],
-            ["Final Recall", f"{recall:.4f}"],
-            ["Total Epochs", epoch + 1],
-            ["Early Stopped", patience_counter >= config.PATIENCE]
-        ]
-        wandb.log({"training_summary": wandb.Table(data=summary_data, columns=["Metric", "Value"])})
+        # Create and log training summary table (string-safe rows); fallback to dict on error
+        try:
+            def _to_text(x):
+                if x is None:
+                    return ""
+                try:
+                    return str(x)
+                except Exception:
+                    import json as _json
+                    return _json.dumps(x, default=str)
+
+            summary_rows = [
+                ["Best Validation AUC", _to_text(f"{best_auc:.4f}")],
+                ["Final Validation Accuracy", _to_text(f"{val_acc:.2f}%")],
+                ["Final F1 Score", _to_text(f"{f1:.4f}")],
+                ["Final Precision", _to_text(f"{precision:.4f}")],
+                ["Final Recall", _to_text(f"{recall:.4f}")],
+                ["Total Epochs", _to_text(epoch + 1)],
+                ["Early Stopped", _to_text(patience_counter >= config.PATIENCE)]
+            ]
+            wandb.log({
+                "training_summary": wandb.Table(columns=["Metric", "Value"], data=summary_rows)
+            })
+        except Exception as e:
+            try:
+                wandb.log({
+                    "training_summary_fallback": {
+                        "Best Validation AUC": _to_text(f"{best_auc:.4f}"),
+                        "Final Validation Accuracy": _to_text(f"{val_acc:.2f}%"),
+                        "Final F1 Score": _to_text(f"{f1:.4f}"),
+                        "Final Precision": _to_text(f"{precision:.4f}"),
+                        "Final Recall": _to_text(f"{recall:.4f}"),
+                        "Total Epochs": _to_text(epoch + 1),
+                        "Early Stopped": _to_text(patience_counter >= config.PATIENCE)
+                    }
+                })
+                print(f"[wandb] Table logging failed; used fallback dict. Reason: {e}")
+            except Exception as e2:
+                print(f"[wandb] Failed to log training summary: {e2}")
         
     if WANDB_AVAILABLE:
+        # Attach logs at the end of the run
+        _wandb_log_supporting_files(config, fold, phase_name='phase1', final=True)
         wandb.finish()
 
 def train_phase2(config: Config, fold: int = 0, writer = None):
@@ -1306,6 +1800,7 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
             tags=['phase2', 'mil-finetuning', 'attention', f'fold{fold}'],
             notes="MIL fine-tuning with frozen backbone, training attention mechanism"
         )
+        _wandb_log_supporting_files(config, fold, phase_name='phase2', final=False)
     
     # Initialize TensorBoard writer if available and not provided
     if writer is None and TENSORBOARD_AVAILABLE and config.TENSORBOARD_DIR:
@@ -1334,15 +1829,24 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
     # Optimization: torch.compile for faster training
     if config.USE_TORCH_COMPILE and hasattr(torch, 'compile'):
         try:
-            # Test compilation first
+            # Eager probe
             dummy_input = torch.randn(1, 1, 3, config.PATCH_SIZE, config.PATCH_SIZE).to(config.DEVICE)
             with torch.no_grad():
                 _ = model(dummy_input)
-            
-            model = torch.compile(model, mode='reduce-overhead')
+
+            compiled_model = torch.compile(model, mode='reduce-overhead')
+            # Probe compiled forward
+            with torch.no_grad():
+                _ = compiled_model(dummy_input)
+
+            model = compiled_model
             print("Phase 2 model compiled with torch.compile")
         except Exception as e:
-            print(f"torch.compile failed for Phase 2 model: {e}")
+            print(f"[compile] Disabled torch.compile for Phase 2 due to: {e}")
+            try:
+                config.USE_TORCH_COMPILE = False
+            except Exception:
+                pass
     
     # Optimization: Enable cuDNN benchmark
     if torch.cuda.is_available():
@@ -1356,10 +1860,11 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
         pass
 
     # Use lower learning rate for fine-tuning
-    optimizer = optim.AdamW(
+    optimizer = make_adamw(
         filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=config.LR_PHASE2, 
-        weight_decay=config.WEIGHT_DECAY
+        lr=config.LR_PHASE2,
+        weight_decay=config.WEIGHT_DECAY,
+        config=config
     )
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
     
@@ -1370,7 +1875,8 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
         criterion = nn.CrossEntropyLoss()
     
     # AMP
-    scaler = torch.cuda.amp.GradScaler()
+    use_bf16 = getattr(config, 'AMP_DTYPE', torch.float16) == torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
 
     # Checkpoint paths and resume state
     latest_ckpt_path = config.CHECKPOINT_DIR / f"phase2_fold{fold}_latest.pth"
@@ -1514,9 +2020,9 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
             images = images[:num_instances].unsqueeze(0)  # [1, num_instances, C, H, W]
             labels = labels[:1]  # Use only first label (slide-level)
             
-            optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast():
+            optimizer.zero_grad(set_to_none=getattr(config, 'ZERO_SET_TO_NONE', True))
+
+            with autocast_ctx(config):
                 outputs, attention_weights = model(images)
                 loss = criterion(outputs, labels)
             
@@ -1571,15 +2077,15 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
                 images = images[:num_instances].unsqueeze(0)
                 labels = labels[:1]
                 
-                with torch.cuda.amp.autocast():
+                with autocast_ctx(config):
                     outputs, attention_weights = model(images)
                     loss = criterion(outputs, labels)
                 
                 val_loss += loss.item()
                 
-                preds = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                preds = to_numpy_fp32(torch.softmax(outputs, dim=1)[:, 1])
                 all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
+                all_labels.extend(to_numpy_fp32(labels))
                 
                 # Calculate validation accuracy
                 _, predicted = outputs.max(1)
@@ -1655,6 +2161,7 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
     if writer:
         writer.close()
     if WANDB_AVAILABLE:
+        _wandb_log_supporting_files(config, fold, phase_name='phase2', final=True)
         wandb.finish()
 
 def explain_predictions(config: Config, model_path: str, fold: int = 0, num_samples: int = 5):
@@ -1667,7 +2174,29 @@ def explain_predictions(config: Config, model_path: str, fold: int = 0, num_samp
     
     # Load model
     model = AttentionMIL(backbone='resnet50', num_classes=config.NUM_CLASSES)
-    model.load_state_dict(torch.load(model_path, map_location=config.DEVICE))
+    # Be robust to different checkpoint formats
+    try:
+        obj = torch.load(model_path, map_location=config.DEVICE)
+        state = obj
+        if isinstance(obj, dict):
+            if 'model_state_dict' in obj and isinstance(obj['model_state_dict'], dict):
+                state = obj['model_state_dict']
+            elif 'state_dict' in obj and isinstance(obj['state_dict'], dict):
+                state = obj['state_dict']
+        if isinstance(state, dict):
+            # If keys look like a raw ResNet backbone (conv1/layer1/...) remap to feature_extractor.*
+            if any(k.startswith(('conv1.', 'layer1.', 'layer2.', 'layer3.', 'layer4.', 'fc.')) for k in state.keys()):
+                remapped = {f"feature_extractor.{k}": v for k, v in state.items()}
+                state = remapped
+            # Load non-strict to tolerate partial/backbone-only weights
+            try:
+                model.load_state_dict(state, strict=False)
+            except Exception as e:
+                print(f"[explain] Non-strict load_state_dict failed: {e}; proceeding with randomly initialized weights")
+        else:
+            print("[explain] Unexpected checkpoint format; proceeding with randomly initialized weights")
+    except Exception as e:
+        print(f"[explain] Could not load checkpoint '{model_path}': {e}; proceeding with randomly initialized weights")
     model = model.to(config.DEVICE)
     model.eval()
     
@@ -1769,6 +2298,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
     
     if WANDB_AVAILABLE:
         wandb.init(project=config.WANDB_PROJECT, name=f"segmentation_fold{fold}", config=vars(config))
+        _wandb_log_supporting_files(config, fold, phase_name='segmentation', final=False)
     
     # Initialize TensorBoard writer if available and not provided
     if writer is None and TENSORBOARD_AVAILABLE and config.TENSORBOARD_DIR:
@@ -1783,14 +2313,32 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
     # Model
     model = SegmentationUNet()
     model = model.to(config.DEVICE)
+    if getattr(config, 'USE_CHANNELS_LAST', False) and torch.cuda.is_available():
+        try:
+            model = model.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
     
     # Optimization: torch.compile for faster training
     if config.USE_TORCH_COMPILE and hasattr(torch, 'compile'):
         try:
-            model = torch.compile(model)
+            compiled_model = torch.compile(model, mode='reduce-overhead')
+            # Validate compiled forward once to catch TritonMissing early
+            H = getattr(config, 'PATCH_SIZE_SEG', getattr(config, 'PATCH_SIZE', 256))
+            W = getattr(config, 'PATCH_SIZE_SEG', getattr(config, 'PATCH_SIZE', 256))
+            probe = torch.randn(1, 3, H, W, device=config.DEVICE)
+            if getattr(config, 'USE_CHANNELS_LAST', False) and torch.cuda.is_available():
+                probe = probe.to(memory_format=torch.channels_last)
+            with torch.no_grad():
+                _ = compiled_model(probe)
+            model = compiled_model
             print("Segmentation model compiled with torch.compile")
         except Exception as e:
-            print(f"torch.compile not available or failed: {e}")
+            print(f"[compile] Disabled torch.compile for Segmentation due to: {e}")
+            try:
+                config.USE_TORCH_COMPILE = False
+            except Exception:
+                pass
     
     # Optimization: Enable cuDNN benchmark
     if torch.cuda.is_available():
@@ -1798,7 +2346,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
         torch.backends.cudnn.enabled = True
     
     # Optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=config.LR_PHASE1, weight_decay=config.WEIGHT_DECAY)
+    optimizer = make_adamw(model.parameters(), lr=config.LR_PHASE1, weight_decay=config.WEIGHT_DECAY, config=config)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
     
     # Loss
@@ -1806,7 +2354,8 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
     bce_loss = nn.BCEWithLogitsLoss()
     
     # AMP
-    scaler = torch.cuda.amp.GradScaler()
+    use_bf16 = getattr(config, 'AMP_DTYPE', torch.float16) == torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
     
     # Checkpoint paths and resume state
     latest_ckpt_path = config.CHECKPOINT_DIR / f"segmentation_fold{fold}_latest.pth"
@@ -1856,9 +2405,9 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
             images = images.to(config.DEVICE, non_blocking=True)
             masks = masks.to(config.DEVICE, non_blocking=True)
             
-            optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast():
+            optimizer.zero_grad(set_to_none=getattr(config, 'ZERO_SET_TO_NONE', True))
+
+            with autocast_ctx(config):
                 outputs = model(images)
                 dice_l = dice_loss(outputs, masks)
                 bce_l = bce_loss(outputs, masks)
@@ -1907,7 +2456,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
                 images = images.to(config.DEVICE, non_blocking=True)
                 masks = masks.to(config.DEVICE, non_blocking=True)
                 
-                with torch.cuda.amp.autocast():
+                with autocast_ctx(config):
                     outputs = model(images)
                     dice_l = dice_loss(outputs, masks)
                     bce_l = bce_loss(outputs, masks)
@@ -1976,9 +2525,11 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
             with torch.no_grad():
                 sample_images, sample_masks = next(iter(val_loader))
                 sample_images = sample_images[:4].to(config.DEVICE)
+                if getattr(config, 'USE_CHANNELS_LAST', False) and sample_images.ndim == 4:
+                    sample_images = sample_images.to(memory_format=torch.channels_last)
                 sample_masks = sample_masks[:4].to(config.DEVICE)
                 
-                with torch.cuda.amp.autocast():
+                with autocast_ctx(config):
                     sample_outputs = model(sample_images)
                 
                 sample_preds = torch.sigmoid(sample_outputs) > 0.5
@@ -2013,6 +2564,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
     if writer:
         writer.close()
     if WANDB_AVAILABLE:
+        _wandb_log_supporting_files(config, fold, phase_name='segmentation', final=True)
         wandb.finish()
 
 def optimize_hyperparameters(config: Config, n_trials: int = 50):
@@ -2082,9 +2634,10 @@ def train_phase1_for_optuna(config: Config, fold: int = 0):
                         attention_dim=config.ATTENTION_DIM, dropout=config.DROPOUT_RATE)
     model = model.to(config.DEVICE)
     
-    optimizer = optim.AdamW(model.parameters(), lr=config.LR_PHASE1, weight_decay=config.WEIGHT_DECAY)
+    optimizer = make_adamw(model.parameters(), lr=config.LR_PHASE1, weight_decay=config.WEIGHT_DECAY, config=config)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler()
+    use_bf16 = getattr(config, 'AMP_DTYPE', torch.float16) == torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
     
     train_loader, val_loader = get_data_loaders(config, fold, 'phase1')
     
@@ -2099,9 +2652,9 @@ def train_phase1_for_optuna(config: Config, fold: int = 0):
             labels = labels.to(config.DEVICE, non_blocking=True)
             images = images.unsqueeze(0)
             
-            optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast():
+            optimizer.zero_grad(set_to_none=getattr(config, 'ZERO_SET_TO_NONE', True))
+
+            with autocast_ctx(config):
                 outputs, _ = model(images)
                 loss = criterion(outputs.squeeze(0), labels)
             
@@ -2121,12 +2674,12 @@ def train_phase1_for_optuna(config: Config, fold: int = 0):
                 labels = labels.to(config.DEVICE, non_blocking=True)
                 images = images.unsqueeze(0)
                 
-                with torch.cuda.amp.autocast():
+                with autocast_ctx(config):
                     outputs, _ = model(images)
                 
-                preds = torch.softmax(outputs.squeeze(0), dim=1)[:, 1].cpu().numpy()
+                preds = to_numpy_fp32(torch.softmax(outputs.squeeze(0), dim=1)[:, 1])
                 all_preds.extend(preds)
-                all_labels.extend(labels.cpu().numpy())
+                all_labels.extend(to_numpy_fp32(labels))
         
         if len(set(all_labels)) > 1:
             auc = roc_auc_score(all_labels, all_preds)

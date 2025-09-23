@@ -3,12 +3,10 @@ Setup script for HER2+ Breast Cancer Classification Pipeline
 
 This setup.py file allows for proper package installation and distribution.
 
-Authors:
-    - Primary: T. Buathongtanakarn
-    - AI Assistant: GitHub Copilot
+Authors: T. Buathongtanakarn with assistance from GPT-5 model
 
 Version: 2.1.0
-Last Updated: September 17, 2025
+Last Updated: September 22, 2025
 """
 
 from setuptools import setup, find_packages
@@ -38,11 +36,11 @@ setup(
     name="her2-cancer-pipeline",
     version="2.1.0",
     author="T. Buathongtanakarn",
-    author_email="scientan@gmail.com",  # Update with actual email
+    author_email="scientan@gmail.com",
     description="Deep Learning Pipeline for HER2+ Breast Cancer Classification in Whole Slide Images",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    url="https://github.com/thanakornbua/pathothai",  # Update with actual repo
+    url="https://github.com/thanakornbua/pathothai",
     
     packages=find_packages(),
     include_package_data=True,
