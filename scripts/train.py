@@ -56,6 +56,106 @@ import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import time
+import sys
+import os
+
+# --- Added utility to prevent tqdm issues in certain environments -------------------------------
+def safe_iter_progress(it, desc="", leave=False):
+    """
+    Try tqdm; if the notebook/Windows build is quirky, fall back to a plain iterator.
+    """
+    try:
+        from tqdm import tqdm
+        bar = tqdm(it, desc=desc, leave=leave)
+        # Quick attribute access to catch broken tqdm builds immediately
+        _ = getattr(bar, "update", None)
+        return bar
+    except Exception:
+        print(f"[progress] {desc} — minimal fallback (no tqdm)")
+        for x in it:
+            yield x
+
+def auc_or_skip(y_true, y_score):
+    """
+    Returns (auc_value, skipped_bool).
+    - When validation has both classes: (real_auc, False)
+    - When validation has only one class: (0.0, True)  <-- numeric placeholder + skip flag
+    """
+    import numpy as np
+    from sklearn.metrics import roc_auc_score
+    y = np.asarray(y_true).astype(int)
+    if np.unique(y).size < 2:
+        return 0.0, True
+    s = np.asarray(y_score, dtype=np.float32)
+    return float(roc_auc_score(y, s)), False
+
+def ensure_compile_supported(config):
+    """
+    If config asks for torch.compile but we're on Windows or Triton isn't installed,
+    turn it off and print a clear one-liner.
+    """
+    try:
+        if getattr(config, 'USE_TORCH_COMPILE', False):
+            import importlib.util
+            missing_triton = (importlib.util.find_spec("triton") is None)
+            if os.name == "nt" or missing_triton:
+                config.USE_TORCH_COMPILE = False
+                print("[compile] Disabled: Windows or Triton not available")
+    except Exception:
+        # Never let this pre-check crash training
+        pass
+
+def maybe_force_single_worker_for_notebook(config):
+    """
+    In Windows notebooks (no __main__.__file__), force workers=0 to dodge pickling issues.
+    This is only for quick tests; you can set workers>0 on scripts.
+    """
+    try:
+        if os.name == "nt":
+            main = sys.modules.get("__main__")
+            in_notebook = not hasattr(main, "__file__")
+            if in_notebook and getattr(config, "NUM_WORKERS", 0) > 0:
+                print("[dataloader] Windows notebook → NUM_WORKERS=0 (safe mode)")
+                config.NUM_WORKERS = 0
+    except Exception:
+        pass
+
+def wb_log_env():
+    """
+    Put environment info into wandb.config (no panel warnings).
+    No-op if wandb isn't installed.
+    """
+    try:
+        import wandb, torch
+        wandb.config.update({
+            'env': {
+                'python_version': sys.version.split()[0],
+                'pytorch_version': torch.__version__,
+                'cuda_available': torch.cuda.is_available(),
+                'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU',
+            }
+        }, allow_val_change=True)
+    except Exception:
+        pass
+
+def wb_table_or_dict(key, headers, rows):
+    """
+    Always log something: try a wandb.Table (stringify cells),
+    else fall back to a simple dict.
+    """
+    try:
+        import wandb
+        t = wandb.Table(columns=[str(h) for h in headers])
+        for r in rows:
+            t.add_data(*[str(c) for c in r])
+        wandb.log({key: t})
+    except Exception as e:
+        try:
+            as_dict = {str(h): [str(r[i]) for r in rows] for i, h in enumerate(headers)}
+            import wandb
+            wandb.log({key + "_dict": as_dict})
+        except Exception:
+            print(f"[wandb] table logging failed: {e}")
 
 # --- Perf helpers -------------------------------------------------------------
 # Autocast context that honors preferred dtype (bf16/fp16) with safe fallback
@@ -1271,6 +1371,7 @@ def train_phase1(config: Config, fold: int = 0, writer = None):
             tags=['phase1', 'roi-supervised', 'classification', f'fold{fold}'],
             notes="ROI-supervised classification training with advanced augmentation"
         )
+        wb_log_env()
         # Attach diagnostics and any existing training log at run start
         _wandb_log_supporting_files(config, fold, phase_name='phase1', final=False)
         # Log environment snapshot and dataloader sizes (as config/summary-friendly fields)
@@ -1800,6 +1901,7 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
             tags=['phase2', 'mil-finetuning', 'attention', f'fold{fold}'],
             notes="MIL fine-tuning with frozen backbone, training attention mechanism"
         )
+        wb_log_env()
         _wandb_log_supporting_files(config, fold, phase_name='phase2', final=False)
     
     # Initialize TensorBoard writer if available and not provided
@@ -2009,7 +2111,7 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
         train_correct = 0
         train_total = 0
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Train2 E{epoch+1}", leave=False)):
+        for batch_idx, batch in enumerate(safe_iter_progress(train_loader, desc=f"Train2 E{epoch+1}", leave=False)):
             images, labels = batch
             images = images.to(config.DEVICE, non_blocking=True)
             labels = labels.to(config.DEVICE, non_blocking=True)
@@ -2067,7 +2169,7 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
         val_total = 0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Val2   E{epoch+1}", leave=False):
+            for batch in safe_iter_progress(val_loader, desc=f"Val2   E{epoch+1}", leave=False):
                 images, labels = batch
                 images = images.to(config.DEVICE, non_blocking=True)
                 labels = labels.to(config.DEVICE, non_blocking=True)
@@ -2094,7 +2196,40 @@ def train_phase2(config: Config, fold: int = 0, writer = None):
         
         val_loss /= len(val_loader)
         val_acc = 100. * val_correct / val_total
-        val_auc = roc_auc_score(all_labels, all_preds) if len(set(all_labels)) > 1 else 0.0
+        #val_auc = roc_auc_score(all_labels, all_preds) if len(set(all_labels)) > 1 else 0.0
+        # AUC is undefined if validation has only one class — skip safely
+        if len(set(all_labels)) < 2:
+            print("[metrics] Skipping ROC AUC: only one class present in validation labels.")
+            val_auc = 0.0
+        else:
+            try:
+                # all_preds must be probabilities for the positive class (not hard 0/1 labels)
+                val_auc = float(roc_auc_score(all_labels, all_preds))
+            except Exception as e:
+                print(f"[metrics] AUC computation failed: {e}")
+        # Log to wandb if enabled and available
+        if getattr(config, "USE_WANDB", False):
+            try:
+                import wandb
+                wandb.log({
+                    "val/auc": float(val_auc),
+                    "val/auc_skipped": int(len(set(all_labels)) < 2)  # 1 if AUC was skipped this epoch, else 0
+                })
+            except Exception as e:
+                # Don't crash if wandb isn't available or offline
+                print(f"[wandb] skip logging val metrics: {e}")
+        #end inserting
+
+        # Use the flag so it’s recorded (and your linter won’t complain it’s unused)
+        try:
+            import wandb
+            if getattr(config, "USE_WANDB", False):
+                wandb.log({
+                    "val/auc": float(val_auc),
+                    "val/auc_skipped": int(len(set(all_labels)) < 2)  # 1 if skipped, else 0
+                })
+        except Exception as e:
+            print(f"[wandb] skip logging val metrics: {e}")
         
         # Early stopping
         if val_auc > best_auc + config.MIN_DELTA:
@@ -2298,6 +2433,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
     
     if WANDB_AVAILABLE:
         wandb.init(project=config.WANDB_PROJECT, name=f"segmentation_fold{fold}", config=vars(config))
+        wb_log_env()
         _wandb_log_supporting_files(config, fold, phase_name='segmentation', final=False)
     
     # Initialize TensorBoard writer if available and not provided
@@ -2400,7 +2536,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
         train_loss = 0.0
         train_dice_scores = []
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"TrainSeg E{epoch+1}", leave=False)):
+        for batch_idx, batch in enumerate(safe_iter_progress(train_loader, desc=f"TrainSeg E{epoch+1}", leave=False)):
             images, masks = batch
             images = images.to(config.DEVICE, non_blocking=True)
             masks = masks.to(config.DEVICE, non_blocking=True)
@@ -2429,8 +2565,13 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
             
             # Calculate training Dice
             with torch.no_grad():
-                preds = torch.sigmoid(outputs) > 0.5
-                dice = (2 * (preds * masks).sum() / (preds + masks).sum()).item()
+                preds = (torch.sigmoid(outputs) > 0.5).float()
+                masks = masks.float()
+                eps = 1e-6
+                inter = (preds * masks).sum()
+                pred_sum = preds.sum()
+                mask_sum = masks.sum()
+                dice = ((2.0 * inter + eps) / (pred_sum + mask_sum + eps)).item()
                 train_dice_scores.append(dice)
             
             global_step += 1
@@ -2451,7 +2592,7 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
         val_iou_scores = []
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"ValSeg   E{epoch+1}", leave=False):
+            for batch in safe_iter_progress(val_loader, desc=f"ValSeg   E{epoch+1}", leave=False):
                 images, masks = batch
                 images = images.to(config.DEVICE, non_blocking=True)
                 masks = masks.to(config.DEVICE, non_blocking=True)
@@ -2465,9 +2606,16 @@ def train_segmentation(config: Config, fold: int = 0, writer = None):
                 val_loss += loss.item()
                 
                 # Calculate validation metrics
-                preds = torch.sigmoid(outputs) > 0.5
-                dice = (2 * (preds * masks).sum() / (preds + masks).sum()).item()
-                iou = (preds * masks).sum() / ((preds + masks).sum() - (preds * masks).sum()).item()
+               #preds = torch.sigmoid(outputs) > 0.5
+               #dice = (2 * (preds * masks).sum() / (preds + masks).sum()).item()
+                #ou = (preds * masks).sum() / ((preds + masks).sum() - (preds * masks).sum()).item()
+                preds = (torch.sigmoid(outputs) > 0.5).float()
+                masks = masks.float()
+                eps = 1e-6
+                inter = (preds * masks).sum()
+                union = (preds + masks).sum() - inter
+                dice = ((2.0 * inter + eps) / ((preds + masks).sum() + eps)).item()
+                iou  = ((inter + eps) / (union + eps)).item()
                 
                 val_dice_scores.append(dice)
                 val_iou_scores.append(iou)
@@ -2718,6 +2866,9 @@ def main():
             apply_fast_mode_overrides(config)
         except Exception as e:
             print(f"[FAST] Could not apply fast mode from CLI: {e}")
+
+    ensure_compile_supported(config)
+    maybe_force_single_worker_for_notebook(config)
     
     # Enable optimizations
     if torch.cuda.is_available():
